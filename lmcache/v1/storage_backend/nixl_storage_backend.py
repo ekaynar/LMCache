@@ -67,6 +67,8 @@ class NixlStorageConfig:
     enable_async_put: bool
     use_direct_io: bool
     path: str
+    path_sharding: str
+
 
     @staticmethod
     def validate_nixl_backend(dynamic_storage: bool, backend: str, device: str):
@@ -101,6 +103,7 @@ class NixlStorageConfig:
         pool_size = extra_config.get("nixl_pool_size")
         backend = extra_config.get("nixl_backend")
         path = extra_config.get("nixl_path")
+        path_sharding = extra_config.get("nixl_path_sharding") # {by_gpu}
 
         assert pool_size is not None
         assert backend is not None
@@ -131,6 +134,7 @@ class NixlStorageConfig:
             enable_async_put=enable_async_put,
             use_direct_io=use_direct_io,
             path=path,
+            path_sharding=path_sharding,
         )
 
 
@@ -161,7 +165,7 @@ class NixlDescPool(ABC):
 
 
 class NixlFilePool(NixlDescPool):
-    def __init__(self, size: int, path: str, use_direct_io: bool):
+    def __init__(self, size: int, path: str, use_direct_io: bool, path_sharding: str):
         super().__init__(size)
         self.fds: List[int] = []
 
@@ -176,9 +180,16 @@ class NixlFilePool(NixlDescPool):
                     "use_direct_io is True, but O_DIRECT is not available on "
                     "this system. Falling back to buffered I/O."
                 )
+        base_path = path
+        if path_sharding == "by_gpu":
+            if isinstance(path, str):
+                path = [path]
+            device_id = torch.cuda.current_device()
+            base_path = path[device_id % len(path)]
+
         for i in reversed(range(size)):
             filename = f"obj_{i}_{uuid.uuid4().hex[0:4]}.bin"
-            tmp_path = os.path.join(path, filename)
+            tmp_path = os.path.join(base_path, filename)
             fd = os.open(tmp_path, flags)
             self.fds.append(fd)
 
@@ -669,6 +680,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             nixl_config.pool_size,
             nixl_config.path,
             nixl_config.use_direct_io,
+            nixl_config.path_sharding,
         )
         assert self.pool is not None
 
@@ -681,9 +693,9 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         )
 
     @staticmethod
-    def createPool(backend: str, size: int, path: str, use_direct_io: bool):
+    def createPool(backend: str, size: int, path: str, use_direct_io: bool, path_sharding: str):
         if backend in ("GDS", "GDS_MT", "POSIX", "HF3FS"):
-            return NixlFilePool(size, path, use_direct_io)
+            return NixlFilePool(size, path, use_direct_io, path_sharding)
         elif backend in ("OBJ"):
             return NixlObjectPool(size)
         else:
