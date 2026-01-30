@@ -66,7 +66,7 @@ class NixlStorageConfig:
     enable_presence_cache: bool
     enable_async_put: bool
     use_direct_io: bool
-    path: str
+    path: Union[str, List[str]] 
     path_sharding: str
 
 
@@ -86,6 +86,18 @@ class NixlStorageConfig:
                 return False
 
     @staticmethod
+    def validate_nixl_path(path: Union[str, List[str]], path_sharding: str) -> str:
+        assert path is not None, "nixl_path cannot be None"
+        assert path_sharding == "by_gpu", "Unsupported path_sharding. Only 'by_gpu' is supported currently."
+    
+        paths = [path] if isinstance(path, str) else path
+        assert len(paths) > 0, "nixl_path cannot be an empty list."
+        
+        device_id = torch.cuda.current_device()
+        return paths[device_id % len(paths)]
+        
+
+    @staticmethod
     def from_cache_engine_config(
         config: LMCacheEngineConfig, metadata: LMCacheMetadata
     ):
@@ -103,7 +115,7 @@ class NixlStorageConfig:
         pool_size = extra_config.get("nixl_pool_size")
         backend = extra_config.get("nixl_backend")
         path = extra_config.get("nixl_path")
-        path_sharding = extra_config.get("nixl_path_sharding") # {by_gpu}
+        path_sharding = extra_config.get("nixl_path_sharding", "by_gpu")
 
         assert pool_size is not None
         assert backend is not None
@@ -165,7 +177,7 @@ class NixlDescPool(ABC):
 
 
 class NixlFilePool(NixlDescPool):
-    def __init__(self, size: int, path: str, use_direct_io: bool, path_sharding: str):
+    def __init__(self, size: int, path: Union[str, List[str]], use_direct_io: bool, path_sharding: str):
         super().__init__(size)
         self.fds: List[int] = []
 
@@ -180,13 +192,8 @@ class NixlFilePool(NixlDescPool):
                     "use_direct_io is True, but O_DIRECT is not available on "
                     "this system. Falling back to buffered I/O."
                 )
-        base_path = path
-        if path_sharding == "by_gpu":
-            if isinstance(path, str):
-                path = [path]
-            device_id = torch.cuda.current_device()
-            base_path = path[device_id % len(path)]
-
+        base_path = NixlStorageConfig.validate_nixl_path(path, path_sharding)
+        
         for i in reversed(range(size)):
             filename = f"obj_{i}_{uuid.uuid4().hex[0:4]}.bin"
             tmp_path = os.path.join(base_path, filename)
