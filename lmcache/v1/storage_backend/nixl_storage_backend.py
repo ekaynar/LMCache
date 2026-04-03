@@ -85,7 +85,9 @@ class NixlStorageConfig:
                 return False
 
     @staticmethod
-    def validate_nixl_path(path: Union[str, List[str]], path_sharding: str) -> str:
+    def validate_nixl_path(
+        path: Union[str, List[str]], path_sharding: str, worker_id: int
+    ) -> str:
         assert path is not None, "nixl_path cannot be None"
         assert path_sharding == "by_gpu", (
             "Unsupported path_sharding. Only 'by_gpu' is supported currently."
@@ -94,8 +96,7 @@ class NixlStorageConfig:
         paths = [path] if isinstance(path, str) else path
         assert len(paths) > 0, "nixl_path cannot be an empty list."
 
-        device_id = torch.cuda.current_device()
-        return paths[device_id % len(paths)]
+        return paths[worker_id % len(paths)]
 
     @staticmethod
     def from_cache_engine_config(
@@ -183,6 +184,7 @@ class NixlFilePool(NixlDescPool):
         path: Union[str, List[str]],
         use_direct_io: bool,
         path_sharding: str,
+        worker_id: int,
     ):
         super().__init__(size)
         self.fds: List[int] = []
@@ -198,7 +200,9 @@ class NixlFilePool(NixlDescPool):
                     "use_direct_io is True, but O_DIRECT is not available on "
                     "this system. Falling back to buffered I/O."
                 )
-        base_path = NixlStorageConfig.validate_nixl_path(path, path_sharding)
+        base_path = NixlStorageConfig.validate_nixl_path(
+            path, path_sharding, worker_id
+        )
 
         for i in reversed(range(size)):
             filename = f"obj_{i}_{uuid.uuid4().hex[0:4]}.bin"
@@ -694,6 +698,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             nixl_config.path,
             nixl_config.use_direct_io,
             nixl_config.path_sharding,
+            metadata.worker_id,
         )
         assert self.pool is not None
 
@@ -712,9 +717,12 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         path: Union[str, List[str]],
         use_direct_io: bool,
         path_sharding: str,
+        worker_id: int,
     ):
         if backend in ("GDS", "GDS_MT", "POSIX", "HF3FS"):
-            return NixlFilePool(size, path, use_direct_io, path_sharding)
+            return NixlFilePool(
+                size, path, use_direct_io, path_sharding, worker_id
+            )
         elif backend in ("OBJ"):
             return NixlObjectPool(size)
         else:
