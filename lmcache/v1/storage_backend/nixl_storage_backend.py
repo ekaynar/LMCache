@@ -189,8 +189,6 @@ class NixlFilePool(NixlDescPool):
         super().__init__(size)
         self.fds: List[int] = []
 
-        assert path is not None
-
         flags = os.O_CREAT | os.O_RDWR
         if use_direct_io:
             if hasattr(os, "O_DIRECT"):
