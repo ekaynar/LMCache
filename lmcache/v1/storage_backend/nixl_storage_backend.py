@@ -50,6 +50,7 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+from lmcache.v1.storage_backend.path_sharder import PathSharder
 from lmcache.v1.transfer_channel.transfer_utils import get_correct_device
 
 logger = init_logger(__name__)
@@ -83,41 +84,6 @@ class NixlStorageConfig:
                 return device == "cpu"
             else:
                 return False
-
-    @staticmethod
-    def validate_nixl_path(
-        path: Union[str, List[str]], path_sharding: str, worker_id: int
-    ) -> str:
-        """Validate the NIXL path configuration and select a path for this worker.
-
-        Ensures the path is not None, the sharding strategy is supported, and
-        the path list is non-empty. When multiple paths are provided, selects
-        one via round-robin based on the worker ID.
-
-        Args:
-            path: A single directory path or a list of directory paths for
-                KV-cache storage.
-            path_sharding: The sharding strategy. Currently only ``"by_gpu"``
-                is supported, which assigns paths round-robin by worker ID.
-            worker_id: The local worker (GPU) ID used for round-robin
-                path selection.
-
-        Returns:
-            The selected base path string for this worker.
-
-        Raises:
-            AssertionError: If *path* is ``None``, *path_sharding* is not
-                ``"by_gpu"``, or the resolved path list is empty.
-        """
-        assert path is not None, "nixl_path cannot be None"
-        assert path_sharding == "by_gpu", (
-            "Unsupported path_sharding. Only 'by_gpu' is supported currently."
-        )
-
-        paths = [path] if isinstance(path, str) else path
-        assert len(paths) > 0, "nixl_path cannot be an empty list."
-
-        return paths[worker_id % len(paths)]
 
     @staticmethod
     def from_cache_engine_config(
@@ -202,10 +168,8 @@ class NixlFilePool(NixlDescPool):
     def __init__(
         self,
         size: int,
-        path: Union[str, List[str]],
+        sharder: PathSharder,
         use_direct_io: bool,
-        path_sharding: str,
-        worker_id: int,
     ):
         super().__init__(size)
         self.fds: List[int] = []
@@ -219,7 +183,7 @@ class NixlFilePool(NixlDescPool):
                     "use_direct_io is True, but O_DIRECT is not available on "
                     "this system. Falling back to buffered I/O."
                 )
-        base_path = NixlStorageConfig.validate_nixl_path(path, path_sharding, worker_id)
+        base_path = sharder.selected
 
         for i in reversed(range(size)):
             filename = f"obj_{i}_{uuid.uuid4().hex[0:4]}.bin"
@@ -715,7 +679,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             nixl_config.path,
             nixl_config.use_direct_io,
             nixl_config.path_sharding,
-            metadata.local_worker_id,
+            nixl_config.buffer_device,
         )
         assert self.pool is not None
 
@@ -734,10 +698,16 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         path: Union[str, List[str]],
         use_direct_io: bool,
         path_sharding: str,
-        worker_id: int,
+        dst_device: str,
     ) -> NixlDescPool:
         if backend in ("GDS", "GDS_MT", "POSIX", "HF3FS"):
-            return NixlFilePool(size, path, use_direct_io, path_sharding, worker_id)
+            sharder = PathSharder(
+                raw_csv=path if isinstance(path, str) else ",".join(path),
+                strategy=path_sharding,
+                dst_device=dst_device,
+                create_dirs=True,
+            )
+            return NixlFilePool(size, sharder, use_direct_io)
         elif backend in ("OBJ"):
             return NixlObjectPool(size)
         else:
