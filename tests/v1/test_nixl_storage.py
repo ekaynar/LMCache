@@ -259,3 +259,24 @@ def test_nixl_posix_backend():
     config.extra_config["enable_cuda"] = False
 
     run(config, shape, dtype)
+
+
+@pytest.mark.no_shared_allocator
+def test_nixl_posix_backend_multipath():
+    """Test NIXL backend with multipath support and path sharding."""
+    BASE_DIR = Path(__file__).parent
+    config = LMCacheEngineConfig.from_file(BASE_DIR / "data/nixl_multipath.yaml")
+
+    dtype = torch.bfloat16
+    shape = [2048, 2048]
+
+    config.nixl_buffer_device = "cpu"
+    config.extra_config["nixl_backend"] = "POSIX"
+    config.extra_config["enable_cuda"] = False
+
+    # Test that multipath configuration is properly handled
+    assert isinstance(config.extra_config["nixl_path"], list)
+    assert len(config.extra_config["nixl_path"]) == 3
+    assert config.extra_config["nixl_path_sharding"] == "by_gpu"
+
+    run(config, shape, dtype)

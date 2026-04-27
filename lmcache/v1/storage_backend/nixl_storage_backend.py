@@ -50,6 +50,7 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+from lmcache.v1.storage_backend.path_sharder import PathSharder
 from lmcache.v1.transfer_channel.transfer_utils import get_correct_device
 
 logger = init_logger(__name__)
@@ -66,7 +67,8 @@ class NixlStorageConfig:
     enable_presence_cache: bool
     enable_async_put: bool
     use_direct_io: bool
-    path: str
+    path: Union[str, List[str]]
+    path_sharding: str
 
     @staticmethod
     def validate_nixl_backend(dynamic_storage: bool, backend: str, device: str):
@@ -101,10 +103,12 @@ class NixlStorageConfig:
         pool_size = extra_config.get("nixl_pool_size")
         backend = extra_config.get("nixl_backend")
         path = extra_config.get("nixl_path")
+        path_sharding = extra_config.get("nixl_path_sharding", "by_gpu")
 
         assert pool_size is not None
         assert backend is not None
         assert use_direct_io in [False, True]
+        assert path is not None, "nixl_path cannot be None"
 
         dynamic_storage = pool_size == 0
         if dynamic_storage:
@@ -131,6 +135,7 @@ class NixlStorageConfig:
             enable_async_put=enable_async_put,
             use_direct_io=use_direct_io,
             path=path,
+            path_sharding=path_sharding,
         )
 
 
@@ -161,11 +166,14 @@ class NixlDescPool(ABC):
 
 
 class NixlFilePool(NixlDescPool):
-    def __init__(self, size: int, path: str, use_direct_io: bool):
+    def __init__(
+        self,
+        size: int,
+        sharder: PathSharder,
+        use_direct_io: bool,
+    ):
         super().__init__(size)
         self.fds: List[int] = []
-
-        assert path is not None
 
         flags = os.O_CREAT | os.O_RDWR
         if use_direct_io:
@@ -176,9 +184,11 @@ class NixlFilePool(NixlDescPool):
                     "use_direct_io is True, but O_DIRECT is not available on "
                     "this system. Falling back to buffered I/O."
                 )
+        base_path = sharder.selected
+
         for i in reversed(range(size)):
             filename = f"obj_{i}_{uuid.uuid4().hex[0:4]}.bin"
-            tmp_path = os.path.join(path, filename)
+            tmp_path = os.path.join(base_path, filename)
             fd = os.open(tmp_path, flags)
             self.fds.append(fd)
 
@@ -669,6 +679,8 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             nixl_config.pool_size,
             nixl_config.path,
             nixl_config.use_direct_io,
+            nixl_config.path_sharding,
+            f"cuda:{metadata.worker_id}",
         )
         assert self.pool is not None
 
@@ -681,9 +693,50 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         )
 
     @staticmethod
-    def createPool(backend: str, size: int, path: str, use_direct_io: bool):
+    def createPool(
+        backend: str,
+        size: int,
+        path: Union[str, List[str]],
+        use_direct_io: bool,
+        path_sharding: str,
+        dst_device: str,
+    ) -> NixlDescPool:
+        """Create a NIXL descriptor pool with path sharding support.
+
+        Args:
+            backend: Backend type (e.g., "GDS", "POSIX", "OBJ").
+            size: Pool size.
+            path: Single path string or list of paths for sharding.
+            use_direct_io: Whether to use direct I/O.
+            path_sharding: Sharding strategy (e.g., "by_gpu").
+            dst_device: Device string for path selection.
+
+        Returns:
+            NixlDescPool: The created descriptor pool.
+
+        Raises:
+            ValueError: If backend is unsupported or path is invalid.
+
+        Note:
+            When *path* is provided as a list, entries containing commas will be
+            split when joined for PathSharder. Avoid commas in path entries to
+            prevent unintended sharding.
+        """
+
         if backend in ("GDS", "GDS_MT", "POSIX", "HF3FS"):
-            return NixlFilePool(size, path, use_direct_io)
+            if isinstance(path, list) and any("," in p for p in path):
+                logger.warning(
+                    "nixl_path entries contain commas; joining for PathSharder may "
+                    "cause unintended sharding. Consider paths without commas or a "
+                    "single comma-separated string."
+                )
+            sharder = PathSharder(
+                raw_csv=path if isinstance(path, str) else ",".join(path),
+                strategy=path_sharding,
+                dst_device=dst_device,
+                create_dirs=True,
+            )
+            return NixlFilePool(size, sharder, use_direct_io)
         elif backend in ("OBJ"):
             return NixlObjectPool(size)
         else:
